@@ -21,18 +21,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <sys/select.h>
-
-#ifdef WITH_XDAMAGE
-#include <X11/extensions/Xdamage.h>
-#endif
-
+#include <freerdp/kbd/kbd.h>
+#include <freerdp/codec/color.h>
 #include <freerdp/utils/sleep.h>
 #include <freerdp/utils/memory.h>
 #include <freerdp/utils/thread.h>
-#include <freerdp/codec/color.h>
 
 extern char* xf_pcap_file;
 extern boolean xf_pcap_dump_realtime;
@@ -41,16 +38,67 @@ extern boolean xf_pcap_dump_realtime;
 
 #include "xf_peer.h"
 
+#ifdef WITH_XDAMAGE
+
+void xf_xdamage_init(xfInfo* xfi)
+{
+	int damage_event;
+	int damage_error;
+	int major, minor;
+	XGCValues values;
+
+	if (XDamageQueryExtension(xfi->display, &damage_event, &damage_error) == 0)
+	{
+		printf("XDamageQueryExtension failed\n");
+		return;
+	}
+
+	XDamageQueryVersion(xfi->display, &major, &minor);
+
+	if (XDamageQueryVersion(xfi->display, &major, &minor) == 0)
+	{
+		printf("XDamageQueryVersion failed\n");
+		return;
+	}
+	else if (major < 1)
+	{
+		printf("XDamageQueryVersion failed: major:%d minor:%d\n", major, minor);
+		return;
+	}
+
+	xfi->xdamage_notify_event = damage_event + XDamageNotify;
+	xfi->xdamage = XDamageCreate(xfi->display, DefaultRootWindow(xfi->display), XDamageReportDeltaRectangles);
+
+	if (xfi->xdamage == None)
+	{
+		printf("XDamageCreate failed\n");
+		return;
+	}
+
+#ifdef WITH_XFIXES
+	xfi->xdamage_region = XFixesCreateRegion(xfi->display, NULL, 0);
+
+	if (xfi->xdamage_region == None)
+	{
+		printf("XFixesCreateRegion failed\n");
+		XDamageDestroy(xfi->display, xfi->xdamage);
+		xfi->xdamage = None;
+		return;
+	}
+#endif
+
+	values.subwindow_mode = IncludeInferiors;
+	xfi->xdamage_gc = XCreateGC(xfi->display, DefaultRootWindow(xfi->display), GCSubwindowMode, &values);
+}
+
+#endif
+
 xfInfo* xf_info_init()
 {
 	int i;
 	xfInfo* xfi;
 	int pf_count;
 	int vi_count;
-#ifdef WITH_XDAMAGE
-	int damage_event;
-	int damage_error;
-#endif
 	XVisualInfo* vi;
 	XVisualInfo* vis;
 	XVisualInfo template;
@@ -60,6 +108,8 @@ xfInfo* xf_info_init()
 	xfi = xnew(xfInfo);
 
 	xfi->display = XOpenDisplay(NULL);
+
+	XInitThreads();
 
 	if (xfi->display == NULL)
 	{
@@ -123,9 +173,12 @@ xfInfo* xf_info_init()
 	xfi->clrconv->alpha = 1;
 
 	XSelectInput(xfi->display, DefaultRootWindow(xfi->display), SubstructureNotifyMask);
+
 #ifdef WITH_XDAMAGE
-	XDamageQueryExtension(xfi->display, &damage_event, &damage_error);
+	xf_xdamage_init(xfi);
 #endif 
+
+	freerdp_kbd_init(xfi->display, 0);
 
 	return xfi;
 }
@@ -154,10 +207,37 @@ void xf_peer_context_free(freerdp_peer* client, xfPeerContext* context)
 
 void xf_peer_init(freerdp_peer* client)
 {
+	xfPeerContext* xfp;
+
 	client->context_size = sizeof(xfPeerContext);
 	client->ContextNew = (psPeerContextNew) xf_peer_context_new;
 	client->ContextFree = (psPeerContextFree) xf_peer_context_free;
 	freerdp_peer_context_new(client);
+
+	xfp = (xfPeerContext*) client->context;
+
+	xfp->pipe_fd[0] = -1;
+	xfp->pipe_fd[1] = -1;
+
+	if (pipe(xfp->pipe_fd) < 0)
+		printf("xf_peer_init: pipe failed\n");
+
+	xfp->thread = 0;
+	xfp->activations = 0;
+
+	xfp->stopwatch = stopwatch_create();
+
+	xfp->hdc = gdi_GetDC();
+
+	xfp->hdc->hwnd = (HGDI_WND) malloc(sizeof(GDI_WND));
+	xfp->hdc->hwnd->invalid = gdi_CreateRectRgn(0, 0, 0, 0);
+	xfp->hdc->hwnd->invalid->null = 1;
+
+	xfp->hdc->hwnd->count = 32;
+	xfp->hdc->hwnd->cinvalid = (HGDI_RGN) malloc(sizeof(GDI_RGN) * xfp->hdc->hwnd->count);
+	xfp->hdc->hwnd->ninvalid = 0;
+
+	pthread_mutex_init(&(xfp->mutex), NULL);
 }
 
 STREAM* xf_peer_stream_init(xfPeerContext* context)
@@ -167,63 +247,134 @@ STREAM* xf_peer_stream_init(xfPeerContext* context)
 	return context->s;
 }
 
-void xf_peer_live_rfx(freerdp_peer* client)
+int xf_is_event_set(xfPeerContext* xfp)
 {
-	STREAM* s;
-	int width;
-	int height;
-	uint8* data;
+	fd_set rfds;
+	int num_set;
+	struct timeval time;
+
+	FD_ZERO(&rfds);
+	FD_SET(xfp->pipe_fd[0], &rfds);
+	memset(&time, 0, sizeof(time));
+	num_set = select(xfp->pipe_fd[0] + 1, &rfds, 0, 0, &time);
+
+	return (num_set == 1);
+}
+
+void xf_signal_event(xfPeerContext* xfp)
+{
+	int length;
+
+	length = write(xfp->pipe_fd[1], "sig", 4);
+
+	if (length != 4)
+		printf("xf_signal_event: error\n");
+}
+
+void xf_clear_event(xfPeerContext* xfp)
+{
+	int length;
+
+	while (xf_is_event_set(xfp))
+	{
+		length = read(xfp->pipe_fd[0], &length, 4);
+
+		if (length != 4)
+			printf("xf_clear_event: error\n");
+	}
+}
+
+void* xf_monitor_graphics(void* param)
+{
 	xfInfo* xfi;
-	XImage* image;
-	RFX_RECT rect;
-	uint32 seconds;
-	uint32 useconds;
-	rdpUpdate* update;
+	XEvent xevent;
+	uint32 sec, usec;
+	XRectangle region;
 	xfPeerContext* xfp;
-	SURFACE_BITS_COMMAND* cmd;
+	freerdp_peer* client;
+	int x, y, width, height;
+	XDamageNotifyEvent* notify;
 
-	seconds = 1;
-	useconds = 0;
-	update = client->update;
+	client = (freerdp_peer*) param;
 	xfp = (xfPeerContext*) client->context;
-	xfi = (xfInfo*) xfp->info;
-	cmd = &update->surface_bits_command;
+	xfi = xfp->info;
 
-	width = xfi->width;
-	height = xfi->height;
-	data = (uint8*) xmalloc(width * height * 3);
+	xfp->capture_buffer = (uint8*) xmalloc(xfi->width * xfi->height * 3);
+
+	pthread_detach(pthread_self());
+
+	stopwatch_start(xfp->stopwatch);
 
 	while (1)
 	{
-		if (seconds > 0)
-			freerdp_sleep(seconds);
+		pthread_mutex_lock(&(xfp->mutex));
 
-		if (useconds > 0)
-			freerdp_usleep(useconds);
+		while (XPending(xfi->display))
+		{
+			memset(&xevent, 0, sizeof(xevent));
+			XNextEvent(xfi->display, &xevent);
 
-		s = xf_peer_stream_init(xfp);
+			if (xevent.type == xfi->xdamage_notify_event)
+			{
+				notify = (XDamageNotifyEvent*) &xevent;
 
-		image = xf_snapshot(xfi, 0, 0, width, height);
-		freerdp_image_convert((uint8*) image->data, data, width, height, 32, 24, xfi->clrconv);
+				x = notify->area.x;
+				y = notify->area.y;
+				width = notify->area.width;
+				height = notify->area.height;
 
-		rect.x = 0;
-		rect.y = 0;
-		rect.width = width;
-		rect.height = height;
-		rfx_compose_message(xfp->rfx_context, s, &rect, 1, data, width, height, width * 3);
+				region.x = x;
+				region.y = y;
+				region.width = width;
+				region.height = height;
 
-		cmd->destLeft = 0;
-		cmd->destTop = 0;
-		cmd->destRight = width;
-		cmd->destBottom = height;
-		cmd->bpp = 32;
-		cmd->codecID = client->settings->rfx_codec_id;
-		cmd->width = width;
-		cmd->height = height;
-		cmd->bitmapDataLength = stream_get_length(s);
-		cmd->bitmapData = stream_get_head(s);
-		update->SurfaceBits(update->context, cmd);
+#ifdef WITH_XFIXES
+				XFixesSetRegion(xfi->display, xfi->xdamage_region, &region, 1);
+				XDamageSubtract(xfi->display, xfi->xdamage, xfi->xdamage_region, None);
+#endif
+
+				gdi_InvalidateRegion(xfp->hdc, x, y, width, height);
+
+				stopwatch_stop(xfp->stopwatch);
+				stopwatch_get_elapsed_time_in_useconds(xfp->stopwatch, &sec, &usec);
+
+				if ((sec > 0) || (usec > 30))
+					break;
+			}
+		}
+
+		stopwatch_stop(xfp->stopwatch);
+		stopwatch_get_elapsed_time_in_useconds(xfp->stopwatch, &sec, &usec);
+
+		if ((sec > 0) || (usec > 30))
+		{
+			HGDI_RGN region;
+
+			stopwatch_reset(xfp->stopwatch);
+			stopwatch_start(xfp->stopwatch);
+
+			region = xfp->hdc->hwnd->invalid;
+			pthread_mutex_unlock(&(xfp->mutex));
+
+			xf_signal_event(xfp);
+		}
+		else
+		{
+			pthread_mutex_unlock(&(xfp->mutex));
+		}
+
+		freerdp_usleep(30);
 	}
+
+	return NULL;
+}
+
+void xf_peer_live_rfx(freerdp_peer* client)
+{
+	xfPeerContext* xfp = (xfPeerContext*) client->context;
+
+	if (xfp->activations == 1)
+		pthread_create(&(xfp->thread), 0, xf_monitor_graphics, (void*) client);
 }
 
 static boolean xf_peer_sleep_tsdiff(uint32 *old_sec, uint32 *old_usec, uint32 new_sec, uint32 new_usec)
@@ -301,6 +452,96 @@ void xf_peer_dump_rfx(freerdp_peer* client)
 	}
 }
 
+void xf_peer_rfx_update(freerdp_peer* client, int x, int y, int width, int height)
+{
+	STREAM* s;
+	xfInfo* xfi;
+	RFX_RECT rect;
+	XImage* image;
+	rdpUpdate* update;
+	xfPeerContext* xfp;
+	SURFACE_BITS_COMMAND* cmd;
+
+	update = client->update;
+	xfp = (xfPeerContext*) client->context;
+	cmd = &update->surface_bits_command;
+	xfi = xfp->info;
+
+	if (width * height <= 0)
+		return;
+
+	s = xf_peer_stream_init(xfp);
+
+	image = xf_snapshot(xfp, x, y, width, height);
+
+	freerdp_image_convert((uint8*) image->data, xfp->capture_buffer, width, height, 32, 24, xfi->clrconv);
+
+	rect.x = 0;
+	rect.y = 0;
+	rect.width = width;
+	rect.height = height;
+
+	rfx_compose_message(xfp->rfx_context, s, &rect, 1, xfp->capture_buffer, width, height, width * 3);
+
+	cmd->destLeft = x;
+	cmd->destTop = y;
+	cmd->destRight = width;
+	cmd->destBottom = height;
+	cmd->bpp = 32;
+	cmd->codecID = client->settings->rfx_codec_id;
+	cmd->width = width;
+	cmd->height = height;
+	cmd->bitmapDataLength = stream_get_length(s);
+	cmd->bitmapData = stream_get_head(s);
+
+	update->SurfaceBits(update->context, cmd);
+}
+
+boolean xf_peer_get_fds(freerdp_peer* client, void** rfds, int* rcount)
+{
+	xfPeerContext* xfp = (xfPeerContext*) client->context;
+
+	if (xfp->pipe_fd[0] == -1)
+		return true;
+
+	rfds[*rcount] = (void *)(long) xfp->pipe_fd[0];
+	(*rcount)++;
+
+	return true;
+}
+
+boolean xf_peer_check_fds(freerdp_peer* client)
+{
+	xfInfo* xfi;
+	xfPeerContext* xfp;
+
+	xfp = (xfPeerContext*) client->context;
+	xfi = xfp->info;
+
+	if (xfp->pipe_fd[0] == -1)
+		return true;
+
+	if (xfp->activated == false)
+		return true;
+
+	if (xf_is_event_set(xfp))
+	{
+		HGDI_RGN region;
+
+		xf_clear_event(xfp);
+
+		region = xfp->hdc->hwnd->invalid;
+
+		if (region->null)
+			return true;
+
+		xf_peer_rfx_update(client, region->x, region->y, region->w, region->h);
+		region->null = true;
+	}
+
+	return true;
+}
+
 boolean xf_peer_capabilities(freerdp_peer* client)
 {
 	return true;
@@ -338,6 +579,7 @@ boolean xf_peer_post_connect(freerdp_peer* client)
 
 	client->settings->width = xfi->width;
 	client->settings->height = xfi->height;
+
 	client->update->DesktopResize(client->update->context);
 	xfp->activated = false;
 
@@ -360,6 +602,7 @@ boolean xf_peer_activate(freerdp_peer* client)
 	else
 	{
 		xf_peer_live_rfx(client);
+		xfp->activations++;
 	}
 
 	return true;
@@ -372,26 +615,28 @@ void xf_peer_synchronize_event(rdpInput* input, uint32 flags)
 
 void xf_peer_keyboard_event(rdpInput* input, uint16 flags, uint16 code)
 {
-	freerdp_peer* client = (freerdp_peer*) input->context->peer;
-	rdpUpdate* update = client->update;
+	unsigned int keycode;
+	boolean extended = false;
 	xfPeerContext* xfp = (xfPeerContext*) input->context;
+	xfInfo* xfi = xfp->info;
 
-	printf("Client sent a keyboard event (flags:0x%X code:0x%X)\n", flags, code);
+	if (flags & KBD_FLAGS_EXTENDED)
+		extended = true;
 
-	if ((flags & 0x4000) && code == 0x1F) /* 's' key */
+	keycode = freerdp_kbd_get_keycode_by_scancode(code, extended);
+
+	if (keycode != 0)
 	{
-		if (client->settings->width != 800)
-		{
-			client->settings->width = 800;
-			client->settings->height = 600;
-		}
-		else
-		{
-			client->settings->width = 640;
-			client->settings->height = 480;
-		}
-		update->DesktopResize(update->context);
-		xfp->activated = false;
+#ifdef WITH_XTEST
+		pthread_mutex_lock(&(xfp->mutex));
+
+		if (flags & KBD_FLAGS_DOWN)
+			XTestFakeKeyEvent(xfi->display, keycode, True, 0);
+		else if (flags & KBD_FLAGS_RELEASE)
+			XTestFakeKeyEvent(xfi->display, keycode, False, 0);
+
+		pthread_mutex_unlock(&(xfp->mutex));
+#endif
 	}
 }
 
@@ -402,12 +647,58 @@ void xf_peer_unicode_keyboard_event(rdpInput* input, uint16 code)
 
 void xf_peer_mouse_event(rdpInput* input, uint16 flags, uint16 x, uint16 y)
 {
-	printf("Client sent a mouse event (flags:0x%X pos:%d,%d)\n", flags, x, y);
+	int button = 0;
+	boolean down = false;
+	xfPeerContext* xfp = (xfPeerContext*) input->context;
+	xfInfo* xfi = xfp->info;
+
+	pthread_mutex_lock(&(xfp->mutex));
+#ifdef WITH_XTEST
+
+	if (flags & PTR_FLAGS_WHEEL)
+	{
+		boolean negative = false;
+
+		if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
+			negative = true;
+
+		button = (negative) ? 5 : 4;
+
+		XTestFakeButtonEvent(xfi->display, button, True, 0);
+		XTestFakeButtonEvent(xfi->display, button, False, 0);
+	}
+	else
+	{
+		if (flags & PTR_FLAGS_MOVE)
+			XTestFakeMotionEvent(xfi->display, 0, x, y, 0);
+
+		if (flags & PTR_FLAGS_BUTTON1)
+			button = 1;
+		else if (flags & PTR_FLAGS_BUTTON2)
+			button = 3;
+		else if (flags & PTR_FLAGS_BUTTON3)
+			button = 2;
+
+		if (flags & PTR_FLAGS_DOWN)
+			down = true;
+
+		if (button != 0)
+			XTestFakeButtonEvent(xfi->display, button, down, 0);
+	}
+#endif
+	pthread_mutex_unlock(&(xfp->mutex));
 }
 
 void xf_peer_extended_mouse_event(rdpInput* input, uint16 flags, uint16 x, uint16 y)
 {
-	printf("Client sent an extended mouse event (flags:0x%X pos:%d,%d)\n", flags, x, y);
+	xfPeerContext* xfp = (xfPeerContext*) input->context;
+	xfInfo* xfi = xfp->info;
+
+	pthread_mutex_lock(&(xfp->mutex));
+#ifdef WITH_XTEST
+	XTestFakeMotionEvent(xfi->display, 0, x, y, CurrentTime);
+#endif
+	pthread_mutex_unlock(&(xfp->mutex));
 }
 
 void* xf_peer_main_loop(void* arg)
@@ -453,6 +744,11 @@ void* xf_peer_main_loop(void* arg)
 			printf("Failed to get FreeRDP file descriptor\n");
 			break;
 		}
+		if (xf_peer_get_fds(client, rfds, &rcount) != true)
+		{
+			printf("Failed to get xfreerdp file descriptor\n");
+			break;
+		}
 
 		max_fds = 0;
 		FD_ZERO(&rfds_set);
@@ -484,7 +780,15 @@ void* xf_peer_main_loop(void* arg)
 		}
 
 		if (client->CheckFileDescriptor(client) != true)
+		{
+			printf("Failed to check freerdp file descriptor\n");
 			break;
+		}
+		if ((xf_peer_check_fds(client)) != true)
+		{
+			printf("Failed to check xfreerdp file descriptor\n");
+			break;
+		}
 	}
 
 	printf("Client %s disconnected.\n", client->hostname);

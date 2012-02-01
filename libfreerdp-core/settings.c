@@ -26,6 +26,7 @@
 #endif
 
 #include <freerdp/settings.h>
+#include <freerdp/utils/file.h>
 
 static const char client_dll[] = "C:\\Windows\\System32\\mstscax.dll";
 
@@ -171,9 +172,10 @@ rdpSettings* settings_new(void* instance)
 		settings->server_auto_reconnect_cookie = xnew(ARC_SC_PRIVATE_PACKET);
 
 		settings->client_time_zone = xnew(TIME_ZONE_INFO);
-
 		settings->server_random = xnew(rdpBlob);
 		settings->server_certificate = xnew(rdpBlob);
+
+		freerdp_detect_paths(settings);
 	}
 
 	return settings;
